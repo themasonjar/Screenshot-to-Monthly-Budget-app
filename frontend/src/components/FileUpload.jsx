@@ -46,10 +46,17 @@ function FileUpload({ projectId, onComplete }) {
       // Determine file type
       if (selectedFile.type === 'text/csv' || selectedFile.name.endsWith('.csv')) {
         setFileType('csv');
+      } else if (selectedFile.type === 'application/json' || selectedFile.name.endsWith('.json')) {
+        setFileType('json');
+      } else if (
+        selectedFile.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+        selectedFile.name.endsWith('.xlsx')
+      ) {
+        setFileType('excel');
       } else if (selectedFile.type.startsWith('image/')) {
         setFileType('image');
       } else {
-        setError('Please upload a CSV file or image (PNG, JPG)');
+        setError('Unsupported file type. Please upload CSV, JSON, Excel, or Image (PNG, JPG).');
         setFile(null);
       }
     }
@@ -136,13 +143,17 @@ function FileUpload({ projectId, onComplete }) {
           Upload a CSV file or screenshot of your bank statement. AI will extract the transaction data for you.
         </p>
 
-        {error && <div className="error">{error}</div>}
+        {error && (
+          <div className="error" style={{ whiteSpace: 'pre-wrap', textAlign: 'left', padding: '15px', border: '1px solid #f5c6cb', backgroundColor: '#f8d7da', color: '#721c24', borderRadius: '4px', marginBottom: '20px' }}>
+            {error}
+          </div>
+        )}
 
         <div className="file-upload" onClick={() => document.getElementById('file-input').click()}>
           <input
             id="file-input"
             type="file"
-            accept=".csv,image/*"
+            accept=".csv,.json,.xlsx,.png,.jpg,.jpeg,image/*"
             onChange={handleFileSelect}
           />
           <div>
@@ -151,7 +162,7 @@ function FileUpload({ projectId, onComplete }) {
               {file ? file.name : 'Click to select file'}
             </p>
             <p style={{ color: '#666', marginTop: '10px' }}>
-              Supports: CSV files and images (PNG, JPG)
+              Supports: CSV, JSON, Excel, PNG, JPG
             </p>
           </div>
         </div>

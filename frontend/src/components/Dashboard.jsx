@@ -242,17 +242,26 @@ function Dashboard({ projectId, projectName, onNavigate, onBack }) {
 
         <div className="input-group">
           <label>Select Month</label>
-          <select
-            value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            style={{ maxWidth: '300px' }}
-          >
-            {availableMonths.map((month) => (
-              <option key={month} value={month}>
-                {month}
-              </option>
-            ))}
-          </select>
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+            <select
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+              style={{ maxWidth: '200px' }}
+            >
+              {availableMonths.map((month) => (
+                <option key={month} value={month}>
+                  {month}
+                </option>
+              ))}
+            </select>
+            <button
+              className="btn btn-secondary"
+              onClick={() => onNavigate('manual-entry')}
+              style={{ whiteSpace: 'nowrap' }}
+            >
+              Manage Data
+            </button>
+          </div>
         </div>
 
         {selectedMonth && (

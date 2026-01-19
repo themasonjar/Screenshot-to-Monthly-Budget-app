@@ -4,6 +4,7 @@ import ProjectSetup from './components/ProjectSetup';
 import Dashboard from './components/Dashboard';
 import DataEntry from './components/DataEntry';
 import FileUpload from './components/FileUpload';
+import ManualEntry from './components/ManualEntry';
 
 function App() {
   const [currentView, setCurrentView] = useState('project-selection');
@@ -72,6 +73,13 @@ function App() {
 
       {currentView === 'file-upload' && currentProject && (
         <FileUpload
+          projectId={currentProject.id}
+          onComplete={handleBackToDashboard}
+        />
+      )}
+
+      {currentView === 'manual-entry' && currentProject && (
+        <ManualEntry
           projectId={currentProject.id}
           onComplete={handleBackToDashboard}
         />

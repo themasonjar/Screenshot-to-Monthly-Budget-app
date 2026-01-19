@@ -267,6 +267,68 @@ def parse_date(date_str):
     return date_str
 
 
+def handle_openai_error(e):
+    """Handle OpenAI API errors and return user-friendly messages"""
+    error_msg = str(e)
+    status_code = 500
+    
+    # Check for specific error types based on exception class name or message content
+    # Note: We use string matching to avoid importing all exception classes if not strictly necessary,
+    # but importing them is better practice. For now, we'll check the error object attributes.
+    
+    if hasattr(e, 'status_code'):
+        status_code = e.status_code
+    elif hasattr(e, 'http_status'):
+        status_code = e.http_status
+        
+    if status_code == 401:
+        return "Authentication Error (401): Your OpenAI API key is invalid or missing. Please check your .env file.", 401
+    elif status_code == 429:
+        return "Rate Limit/Quota Error (429): You have exceeded your OpenAI API quota or rate limit. Please check your billing details at platform.openai.com/account/billing.", 429
+    elif status_code == 404:
+        if 'model' in error_msg.lower():
+            return "Model Not Found (404): The selected AI model is not available for your API key. You may need to add payment details to your OpenAI account to access GPT-4o.", 404
+        return f"Not Found Error (404): {error_msg}", 404
+    elif status_code == 500:
+        return "OpenAI Server Error (500): OpenAI's servers are currently experiencing issues. Please try again later.", 500
+    elif status_code == 503:
+        return "Service Unavailable (503): OpenAI's servers are overloaded. Please try again later.", 503
+        
+    # Generic fallback
+    return f"OpenAI API Error: {error_msg}", status_code
+
+
+def process_chunk_with_ai(content_chunk, content_type="csv"):
+    """
+    Process a chunk of text content (CSV/Excel) using OpenAI.
+    content_type: 'csv' or 'excel'
+    """
+    system_prompt = """You are a financial data extraction assistant. Extract transaction data from the provided content and return it as a JSON array.
+    Each transaction should have: date (YYYY-MM-DD format), amount (positive number), and description.
+    Determine if each transaction is Income, Expenses, or Savings based on context (negative amounts or debits = Expenses, positive or credits = Income, transfers to savings = Savings).
+    Return ONLY a valid JSON array, no other text."""
+
+    user_prompt = f"Extract transaction data from this {content_type.upper()} chunk:\n\n{content_chunk}"
+
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+
+        result = response.choices[0].message.content.strip()
+        # Remove markdown code blocks if present
+        result = re.sub(r'^```json\s*', '', result)
+        result = re.sub(r'\s*```$', '', result)
+        return json.loads(result)
+    except Exception as e:
+        raise e  # Re-raise to be handled by caller
+
+
 @app.route('/api/extract-data', methods=['POST'])
 def extract_data():
     """Extract transaction data from uploaded file using AI"""
@@ -289,47 +351,95 @@ def extract_data():
             # Process CSV file
             try:
                 df = pd.read_csv(file)
-                csv_content = df.to_string()
+                extracted_data = []
+                
+                # Chunking parameters
+                chunk_size = 50
+                total_rows = len(df)
+                
+                print(f"Processing CSV with {total_rows} rows in chunks of {chunk_size}...")
 
-                # Use OpenAI to extract structured data from CSV
-                response = openai.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": """You are a financial data extraction assistant. Extract transaction data from the provided CSV content and return it as a JSON array.
-                            Each transaction should have: date (YYYY-MM-DD format), amount (positive number), and description.
-                            Determine if each transaction is Income, Expenses, or Savings based on context (negative amounts or debits = Expenses, positive or credits = Income, transfers to savings = Savings).
-                            Return ONLY a valid JSON array, no other text."""
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Extract transaction data from this CSV:\n\n{csv_content}"
-                        }
-                    ],
-                    temperature=0.3
-                )
-
-                result = response.choices[0].message.content.strip()
-                # Remove markdown code blocks if present
-                result = re.sub(r'^```json\s*', '', result)
-                result = re.sub(r'\s*```$', '', result)
-                extracted_data = json.loads(result)
+                for i in range(0, total_rows, chunk_size):
+                    chunk = df.iloc[i:i+chunk_size]
+                    csv_content = chunk.to_string()
+                    
+                    try:
+                        chunk_data = process_chunk_with_ai(csv_content, "csv")
+                        extracted_data.extend(chunk_data)
+                        print(f"  Processed chunk {i//chunk_size + 1}/{(total_rows + chunk_size - 1)//chunk_size}")
+                    except Exception as e:
+                        print(f"  Error processing chunk starting at row {i}: {e}")
+                        # Continue to next chunk or fail? Let's continue but log.
+                        # For now, we will fail if AI fails to parse JSON completely, 
+                        # but in production partial success might be better.
+                        # Re-raising for now to bubble up the OpenAI specific errors.
+                        raise e
 
             except Exception as e:
+                if "openai" in str(type(e)).lower():
+                    msg, code = handle_openai_error(e)
+                    return jsonify({'success': False, 'error': msg}), code
                 return jsonify({'success': False, 'error': f'CSV processing error: {str(e)}'}), 500
 
-        else:  # Screenshot/Image
+        elif file_type == 'json':
+            # Process JSON file
+            try:
+                content = json.load(file)
+                # Ensure it's a list of transactions
+                if isinstance(content, list):
+                    extracted_data = content
+                elif isinstance(content, dict) and 'transactions' in content:
+                    extracted_data = content['transactions']
+                else:
+                    return jsonify({'success': False, 'error': 'Invalid JSON format. Expected a list of transactions or an object with a "transactions" key.'}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': f'JSON processing error: {str(e)}'}), 500
+
+        elif file_type == 'excel':
+            # Process Excel file
+            try:
+                df = pd.read_excel(file)
+                extracted_data = []
+                
+                # Chunking parameters
+                chunk_size = 50
+                total_rows = len(df)
+                
+                print(f"Processing Excel with {total_rows} rows in chunks of {chunk_size}...")
+
+                for i in range(0, total_rows, chunk_size):
+                    chunk = df.iloc[i:i+chunk_size]
+                    excel_content = chunk.to_string()
+                    
+                    try:
+                        chunk_data = process_chunk_with_ai(excel_content, "excel")
+                        extracted_data.extend(chunk_data)
+                        print(f"  Processed chunk {i//chunk_size + 1}/{(total_rows + chunk_size - 1)//chunk_size}")
+                    except Exception as e:
+                        print(f"  Error processing chunk starting at row {i}: {e}")
+                        raise e
+
+            except Exception as e:
+                if "openai" in str(type(e)).lower():
+                    msg, code = handle_openai_error(e)
+                    return jsonify({'success': False, 'error': msg}), code
+                return jsonify({'success': False, 'error': f'Excel processing error: {str(e)}'}), 500
+
+        elif file_type == 'image':  # Screenshot/Image (PNG, JPG, JPEG)
             try:
                 # Read image and convert to base64
                 image = Image.open(file.stream)
                 buffered = BytesIO()
-                image.save(buffered, format="PNG")
+                # Convert to RGB if necessary (e.g. for JPEGs)
+                if image.mode in ("RGBA", "P"):
+                    image = image.convert("RGB")
+                
+                image.save(buffered, format="PNG") # Save as PNG for API consistency
                 img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
                 # Use OpenAI Vision to extract data from screenshot
                 response = openai.chat.completions.create(
-                    model="gpt-4-vision-preview",
+                    model="gpt-4o-mini",
                     messages=[
                         {
                             "role": "user",
@@ -361,7 +471,13 @@ def extract_data():
                 extracted_data = json.loads(result)
 
             except Exception as e:
+                if "openai" in str(type(e)).lower():
+                    msg, code = handle_openai_error(e)
+                    return jsonify({'success': False, 'error': msg}), code
                 return jsonify({'success': False, 'error': f'Image processing error: {str(e)}'}), 500
+        
+        else:
+            return jsonify({'success': False, 'error': 'Unsupported file type'}), 400
 
         # Normalize dates
         for transaction in extracted_data:

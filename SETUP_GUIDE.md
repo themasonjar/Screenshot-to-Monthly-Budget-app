@@ -5,6 +5,7 @@
 - Node.js v16+ and npm
 - Python 3.8+
 - OpenAI API Key (for AI features)
+- Upstash Redis database (for persistence)
 
 ## Installation Steps
 
@@ -28,7 +29,7 @@ pip install -r requirements.txt
 
 # Configure environment
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env and add your OPENAI_API_KEY + Upstash credentials
 
 # Start server
 python app.py
@@ -63,7 +64,9 @@ Frontend runs on: `http://localhost:3000`
 
 ### Backend Issues
 
-**Database not created**: The SQLite database is auto-created on first run.
+**Upstash env vars missing**: The backend requires Upstash Redis for persistence. Ensure these are set:
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
 
 **OpenAI API errors**: Make sure your API key is valid and has credits.
 
@@ -86,29 +89,32 @@ app.run(debug=True, port=5001)
 
 ```
 OPENAI_API_KEY=sk-your-key-here
+UPSTASH_REDIS_REST_URL=https://your-upstash-rest-url
+UPSTASH_REDIS_REST_TOKEN=your-upstash-rest-token
 FLASK_ENV=development
 FLASK_DEBUG=True
 ```
 
 ## Production Deployment
 
-### Backend
+### Vercel (recommended)
 
-1. Set `FLASK_DEBUG=False` in `.env`
-2. Use a production WSGI server (gunicorn):
-   ```bash
-   pip install gunicorn
-   gunicorn -w 4 -b 0.0.0.0:5000 app:app
-   ```
+This repo is configured to deploy **frontend + API together** on Vercel.
 
-### Frontend
+1. Import the Git repository into Vercel:  
+   [Import an existing project](https://vercel.com/docs/getting-started-with-vercel/import)
 
-1. Build the production bundle:
-   ```bash
-   npm run build
-   ```
+2. Add the Upstash Redis integration to the Vercel project and connect a Redis database.  
+   After env vars are added, **redeploy** for them to take effect:  
+   [Vercel - Upstash Redis Integration](https://upstash.com/docs/redis/howto/vercelintegration)
 
-2. Serve the `dist` folder using a static file server or CDN
+3. In Vercel Project Settings → Environment Variables:
+   - Set `OPENAI_API_KEY`
+   - Confirm Upstash created `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`
+
+4. Deploy and verify:
+   - Visit the deployed site
+   - Check API health at `GET /api/health`
 
 ## API Health Check
 

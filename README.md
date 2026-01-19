@@ -36,7 +36,7 @@ A comprehensive full-stack web application for tracking personal finances with A
 
 ### Backend
 - **Python 3.x** with **Flask** - REST API framework
-- **SQLite** - Lightweight database for data persistence
+- **Upstash Redis** - Persistent datastore (serverless-friendly for Vercel)
 - **OpenAI API** - GPT-4 and GPT-4 Vision for AI extraction
 - **Pandas** - CSV data processing
 - **Pillow** - Image processing
@@ -52,12 +52,13 @@ A comprehensive full-stack web application for tracking personal finances with A
 
 ```
 Screenshot-to-Monthly-Budget-app/
+├── api/
+│   └── index.py               # Vercel Python Serverless Function entrypoint
 ├── backend/
 │   ├── app.py                 # Flask API server
 │   ├── database.py            # Database models and operations
 │   ├── requirements.txt       # Python dependencies
-│   ├── .env.example          # Environment variables template
-│   └── budget_app.db         # SQLite database (auto-generated)
+│   └── .env.example           # Environment variables template (local dev)
 │
 ├── frontend/
 │   ├── src/
@@ -71,6 +72,8 @@ Screenshot-to-Monthly-Budget-app/
 │   └── vite.config.js
 │
 ├── .gitignore
+├── requirements.txt           # Root Python deps (for Vercel runtime)
+├── vercel.json                # Vercel build + routing config
 ├── README.md
 └── SETUP_GUIDE.md
 ```
@@ -86,7 +89,7 @@ See [SETUP_GUIDE.md](./SETUP_GUIDE.md) for detailed installation instructions.
 cd backend
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # Add your OPENAI_API_KEY
+cp .env.example .env  # Add OPENAI_API_KEY + Upstash env vars
 python app.py
 
 # Frontend (new terminal)
@@ -143,6 +146,45 @@ Visit `http://localhost:3000`
 - **AI**: Extract data from files
 
 See inline API documentation in `backend/app.py`
+
+## 🔐 Environment Variables
+
+### Backend
+
+- **`OPENAI_API_KEY`**: required for AI extraction endpoints
+- **`UPSTASH_REDIS_REST_URL`**: required for persistence (Upstash Redis REST URL)
+- **`UPSTASH_REDIS_REST_TOKEN`**: required for persistence (Upstash Redis REST token)
+
+## ☁️ Deploy to Vercel (Frontend + API in one project)
+
+This repository is configured to deploy as a single Vercel project:
+- The React app is built from `frontend/`
+- The Flask API is exposed as a Vercel Python Serverless Function via `api/index.py`
+- Requests to **`/api/*`** are routed to Flask; all other routes serve the SPA
+
+### 1) Import the repo into Vercel
+
+Follow Vercel’s import flow to bring in the existing Git repository and deploy it:  
+[Import an existing project](https://vercel.com/docs/getting-started-with-vercel/import)
+
+### 2) Add the Upstash Redis integration
+
+Install and connect Upstash Redis to your Vercel project (create a new Upstash account or link an existing one).  
+After connecting, Vercel will add the required Redis env vars to the project and **you must redeploy** for them to take effect.  
+[Vercel - Upstash Redis Integration](https://upstash.com/docs/redis/howto/vercelintegration)
+
+### 3) Set required environment variables
+
+In Vercel Project Settings → Environment Variables:
+- Set **`OPENAI_API_KEY`**
+- Confirm Upstash created:
+  - **`UPSTASH_REDIS_REST_URL`**
+  - **`UPSTASH_REDIS_REST_TOKEN`**
+
+### 4) Verify after deploy
+
+- Open the deployed site
+- Check API health at `GET /api/health`
 
 ## 🧪 Testing
 

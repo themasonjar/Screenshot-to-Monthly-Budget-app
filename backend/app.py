@@ -1,6 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from database import Database
+try:
+    # When imported as a package (e.g. from Vercel `api/index.py`)
+    from .database import Database
+except ImportError:
+    # When run directly for local dev (e.g. `python backend/app.py`)
+    from database import Database
 import os
 from dotenv import load_dotenv
 import openai

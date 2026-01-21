@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Optional
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 import base64
 from io import BytesIO
 from PIL import Image
@@ -51,8 +51,18 @@ def get_db() -> Database:
         _db_init_error = e
         raise
 
-# Configure OpenAI
-openai.api_key = os.getenv('OPENAI_API_KEY', '')
+# Lazy OpenAI client init (avoids import-time surprises, keeps config centralized)
+_openai_client: Optional[OpenAI] = None
+
+
+def get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+    # OpenAI SDK will also read OPENAI_API_KEY from env by default
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    _openai_client = OpenAI(api_key=api_key or None)
+    return _openai_client
 
 
 @app.before_request
@@ -430,7 +440,7 @@ def process_chunk_with_ai(content_chunk, content_type="csv"):
     user_prompt = f"Extract transaction data from this {content_type.upper()} chunk:\n\n{content_chunk}"
 
     try:
-        response = openai.chat.completions.create(
+        response = get_openai_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -458,7 +468,7 @@ def extract_data():
         file = request.files['file']
         file_type = request.form.get('fileType', '')
 
-        if not openai.api_key:
+        if not os.getenv("OPENAI_API_KEY"):
             return jsonify({
                 'success': False,
                 'error': 'OpenAI API key not configured. Please set OPENAI_API_KEY in .env file'
@@ -557,7 +567,7 @@ def extract_data():
                 img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
                 # Use OpenAI Vision to extract data from screenshot
-                response = openai.chat.completions.create(
+                response = get_openai_client().chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {
@@ -630,7 +640,7 @@ def health_check():
         {
             'success': True,
             'message': 'Budget Management API is running',
-            'openai_configured': bool(openai.api_key),
+            'openai_configured': bool(os.getenv("OPENAI_API_KEY")),
             'redis_configured': redis_configured,
             'redis_ok': redis_ok,
             'redis_error': redis_error,

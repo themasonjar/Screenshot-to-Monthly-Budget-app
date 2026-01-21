@@ -93,14 +93,30 @@ class Database:
             out.append(m.decode() if isinstance(m, (bytes, bytearray)) else str(m))
         return out
 
+    def _hset_mapping(self, key: str, mapping: Dict[str, str]) -> None:
+        """
+        Set multiple hash fields in a client-compatible way.
+
+        Upstash's python SDK uses `values=` for multi-field HSET, not `mapping=`.
+        Some environments/versions may only support the 3-arg form (key, field, value),
+        so we fall back to per-field writes if needed.
+        """
+        try:
+            # Upstash SDK signature: hset(key, values={...})
+            self.redis.hset(key, values=mapping)
+        except TypeError:
+            # Fallback for older/alternate clients
+            for field, value in mapping.items():
+                self.redis.hset(key, field, value)
+
     # Project operations
     def create_project(self, name: str) -> int:
         """Create a new project"""
         project_id = int(self.redis.incr(self._k("project:next_id")))
         now = _utc_now_iso()
-        self.redis.hset(
+        self._hset_mapping(
             self._k(f"project:{project_id}"),
-            mapping={"id": str(project_id), "name": name, "created_at": now, "updated_at": now},
+            {"id": str(project_id), "name": name, "created_at": now, "updated_at": now},
         )
         # Newest first: store created_at as sortable score (epoch seconds)
         score = int(datetime.now(timezone.utc).timestamp())
@@ -160,9 +176,9 @@ class Database:
     def add_category(self, project_id: int, name: str, category_type: str) -> int:
         """Add a category to a project"""
         category_id = int(self.redis.incr(self._k("category:next_id")))
-        self.redis.hset(
+        self._hset_mapping(
             self._k(f"category:{category_id}"),
-            mapping={
+            {
                 "id": str(category_id),
                 "project_id": str(project_id),
                 "name": name,
@@ -215,9 +231,9 @@ class Database:
         month = _month_key(dt)
         score = int(dt.timestamp())
 
-        self.redis.hset(
+        self._hset_mapping(
             self._k(f"transaction:{transaction_id}"),
-            mapping={
+            {
                 "id": str(transaction_id),
                 "project_id": str(project_id),
                 "date": date,
@@ -318,7 +334,7 @@ class Database:
             self.redis.srem(self._k(f"project:{project_id}:transactions:month:{old_month}"), str(transaction_id))
             self.redis.sadd(self._k(f"project:{project_id}:transactions:month:{new_month}"), str(transaction_id))
 
-        self.redis.hset(key, mapping=updates)
+        self._hset_mapping(key, updates)
         return True
 
     def delete_transaction(self, transaction_id: int) -> bool:

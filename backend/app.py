@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 try:
     # When imported as a package (e.g. from Vercel `api/index.py`)
@@ -6,7 +6,11 @@ try:
 except ImportError:
     # When run directly for local dev (e.g. `python backend/app.py`)
     from database import Database
+import logging
 import os
+import time
+import uuid
+from typing import Optional
 from dotenv import load_dotenv
 import openai
 import base64
@@ -16,6 +20,7 @@ import pandas as pd
 import json
 from datetime import datetime
 import re
+from werkzeug.exceptions import HTTPException
 
 # Load environment variables
 load_dotenv()
@@ -23,11 +28,106 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# Initialize database
-db = Database()
+logger = logging.getLogger("budgetapp")
+if not logging.getLogger().handlers:
+    # Ensure logs are emitted in serverless environments
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+# Lazy DB init so Vercel cold-start import never crashes
+_db_instance = None
+_db_init_error: Optional[Exception] = None
+
+
+def get_db() -> Database:
+    global _db_instance, _db_init_error
+    if _db_instance is not None:
+        return _db_instance
+    if _db_init_error is not None:
+        raise _db_init_error
+    try:
+        _db_instance = Database()
+        return _db_instance
+    except Exception as e:
+        _db_init_error = e
+        raise
 
 # Configure OpenAI
 openai.api_key = os.getenv('OPENAI_API_KEY', '')
+
+
+@app.before_request
+def _assign_request_id_and_log_start():
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    g.request_start_time = time.time()
+    logger.info(
+        json.dumps(
+            {
+                "event": "request_start",
+                "request_id": g.request_id,
+                "method": request.method,
+                "path": request.path,
+            }
+        )
+    )
+
+
+@app.after_request
+def _add_request_id_and_log_end(response):
+    request_id = getattr(g, "request_id", None)
+    if request_id:
+        response.headers["X-Request-ID"] = request_id
+    start = getattr(g, "request_start_time", None)
+    duration_ms = int((time.time() - start) * 1000) if isinstance(start, (int, float)) else None
+    logger.info(
+        json.dumps(
+            {
+                "event": "request_end",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            }
+        )
+    )
+    return response
+
+
+@app.errorhandler(HTTPException)
+def _handle_http_exception(e: HTTPException):
+    request_id = getattr(g, "request_id", None)
+    logger.warning(
+        json.dumps(
+            {
+                "event": "http_exception",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.path,
+                "status_code": e.code,
+                "error": e.description,
+            }
+        )
+    )
+    return jsonify({"success": False, "error": e.description, "request_id": request_id}), (e.code or 500)
+
+
+@app.errorhandler(Exception)
+def _handle_unhandled_exception(e: Exception):
+    request_id = getattr(g, "request_id", None)
+    # Full stack trace to Vercel logs
+    logger.exception(
+        "unhandled_exception",
+        extra={
+            "request_id": request_id,
+            "method": getattr(request, "method", None),
+            "path": getattr(request, "path", None),
+        },
+    )
+    # Minimal response body; correlate via request_id and logs
+    return (
+        jsonify({"success": False, "error": "Internal server error", "request_id": request_id}),
+        500,
+    )
 
 
 # ==================== PROJECT ENDPOINTS ====================
@@ -36,10 +136,11 @@ openai.api_key = os.getenv('OPENAI_API_KEY', '')
 def get_projects():
     """Get all projects"""
     try:
-        projects = db.get_all_projects()
+        projects = get_db().get_all_projects()
         return jsonify({'success': True, 'projects': projects})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("get_projects_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects', methods=['POST'])
@@ -52,36 +153,39 @@ def create_project():
         if not name:
             return jsonify({'success': False, 'error': 'Project name is required'}), 400
 
-        project_id = db.create_project(name)
+        project_id = get_db().create_project(name)
         return jsonify({'success': True, 'project_id': project_id})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("create_project_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects/<int:project_id>', methods=['GET'])
 def get_project(project_id):
     """Get a specific project"""
     try:
-        project = db.get_project(project_id)
+        project = get_db().get_project(project_id)
         if not project:
             return jsonify({'success': False, 'error': 'Project not found'}), 404
 
         return jsonify({'success': True, 'project': project})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("get_project_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects/<int:project_id>', methods=['DELETE'])
 def delete_project(project_id):
     """Delete a project"""
     try:
-        deleted = db.delete_project(project_id)
+        deleted = get_db().delete_project(project_id)
         if not deleted:
             return jsonify({'success': False, 'error': 'Project not found'}), 404
 
         return jsonify({'success': True, 'message': 'Project deleted successfully'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("delete_project_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 # ==================== CATEGORY ENDPOINTS ====================
@@ -91,10 +195,11 @@ def get_categories(project_id):
     """Get categories for a project"""
     try:
         category_type = request.args.get('type')
-        categories = db.get_categories(project_id, category_type)
+        categories = get_db().get_categories(project_id, category_type)
         return jsonify({'success': True, 'categories': categories})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("get_categories_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects/<int:project_id>/categories', methods=['POST'])
@@ -111,23 +216,25 @@ def add_category(project_id):
         if category_type not in ['Income', 'Expenses', 'Savings']:
             return jsonify({'success': False, 'error': 'Invalid category type'}), 400
 
-        category_id = db.add_category(project_id, name, category_type)
+        category_id = get_db().add_category(project_id, name, category_type)
         return jsonify({'success': True, 'category_id': category_id})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("add_category_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/categories/<int:category_id>', methods=['DELETE'])
 def delete_category(category_id):
     """Delete a category"""
     try:
-        deleted = db.delete_category(category_id)
+        deleted = get_db().delete_category(category_id)
         if not deleted:
             return jsonify({'success': False, 'error': 'Category not found'}), 404
 
         return jsonify({'success': True, 'message': 'Category deleted successfully'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("delete_category_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 # ==================== TRANSACTION ENDPOINTS ====================
@@ -137,10 +244,11 @@ def get_transactions(project_id):
     """Get transactions for a project"""
     try:
         month = request.args.get('month')
-        transactions = db.get_transactions(project_id, month)
+        transactions = get_db().get_transactions(project_id, month)
         return jsonify({'success': True, 'transactions': transactions})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("get_transactions_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects/<int:project_id>/transactions', methods=['POST'])
@@ -155,7 +263,7 @@ def add_transaction(project_id):
             if field not in data:
                 return jsonify({'success': False, 'error': f'{field} is required'}), 400
 
-        transaction_id = db.add_transaction(
+        transaction_id = get_db().add_transaction(
             project_id=project_id,
             date=data['date'],
             trans_type=data['type'],
@@ -166,7 +274,8 @@ def add_transaction(project_id):
 
         return jsonify({'success': True, 'transaction_id': transaction_id})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("add_transaction_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects/<int:project_id>/transactions/batch', methods=['POST'])
@@ -183,10 +292,11 @@ def add_transactions_batch(project_id):
         for trans in transactions:
             trans['project_id'] = project_id
 
-        transaction_ids = db.add_transactions_batch(transactions)
+        transaction_ids = get_db().add_transactions_batch(transactions)
         return jsonify({'success': True, 'transaction_ids': transaction_ids})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("add_transactions_batch_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/transactions/<int:transaction_id>', methods=['PUT'])
@@ -194,27 +304,29 @@ def update_transaction(transaction_id):
     """Update a transaction"""
     try:
         data = request.json
-        updated = db.update_transaction(transaction_id, data)
+        updated = get_db().update_transaction(transaction_id, data)
 
         if not updated:
             return jsonify({'success': False, 'error': 'Transaction not found'}), 404
 
         return jsonify({'success': True, 'message': 'Transaction updated successfully'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("update_transaction_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/transactions/<int:transaction_id>', methods=['DELETE'])
 def delete_transaction(transaction_id):
     """Delete a transaction"""
     try:
-        deleted = db.delete_transaction(transaction_id)
+        deleted = get_db().delete_transaction(transaction_id)
         if not deleted:
             return jsonify({'success': False, 'error': 'Transaction not found'}), 404
 
         return jsonify({'success': True, 'message': 'Transaction deleted successfully'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("delete_transaction_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 # ==================== ANALYTICS ENDPOINTS ====================
@@ -223,10 +335,11 @@ def delete_transaction(transaction_id):
 def get_summary(project_id):
     """Get monthly summary for a project"""
     try:
-        summary = db.get_monthly_summary(project_id)
+        summary = get_db().get_monthly_summary(project_id)
         return jsonify({'success': True, 'summary': summary})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("get_summary_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 @app.route('/api/projects/<int:project_id>/breakdown', methods=['GET'])
@@ -239,10 +352,11 @@ def get_breakdown(project_id):
         if not month or not trans_type:
             return jsonify({'success': False, 'error': 'Month and type are required'}), 400
 
-        breakdown = db.get_category_breakdown(project_id, month, trans_type)
+        breakdown = get_db().get_category_breakdown(project_id, month, trans_type)
         return jsonify({'success': True, 'breakdown': breakdown})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.exception("get_breakdown_failed")
+        return jsonify({'success': False, 'error': str(e), 'request_id': getattr(g, "request_id", None)}), 500
 
 
 # ==================== AI FILE PROCESSING ENDPOINT ====================
@@ -500,11 +614,29 @@ def extract_data():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({
-        'success': True,
-        'message': 'Budget Management API is running',
-        'openai_configured': bool(openai.api_key)
-    })
+    redis_configured = bool(os.getenv("UPSTASH_REDIS_REST_URL")) and bool(os.getenv("UPSTASH_REDIS_REST_TOKEN"))
+    redis_ok = False
+    redis_error = None
+    if redis_configured:
+        try:
+            db = get_db()
+            # Upstash REST client supports ping()
+            db.redis.ping()
+            redis_ok = True
+        except Exception as e:
+            redis_error = str(e)
+
+    return jsonify(
+        {
+            'success': True,
+            'message': 'Budget Management API is running',
+            'openai_configured': bool(openai.api_key),
+            'redis_configured': redis_configured,
+            'redis_ok': redis_ok,
+            'redis_error': redis_error,
+            'request_id': getattr(g, "request_id", None),
+        }
+    )
 
 
 if __name__ == '__main__':

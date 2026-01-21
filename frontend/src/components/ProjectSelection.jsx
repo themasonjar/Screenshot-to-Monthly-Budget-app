@@ -8,6 +8,21 @@ function ProjectSelection({ onSelectProject }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  const formatApiError = (err, fallbackMessage) => {
+    const requestId =
+      err?.response?.data?.request_id ||
+      err?.response?.headers?.['x-request-id'] ||
+      err?.response?.headers?.['X-Request-Id'];
+
+    const serverMessage = err?.response?.data?.error;
+
+    if (requestId) {
+      return `${fallbackMessage} (request_id: ${requestId})${serverMessage ? `: ${serverMessage}` : ''}`;
+    }
+
+    return fallbackMessage;
+  };
+
   useEffect(() => {
     loadProjects();
   }, []);
@@ -18,7 +33,7 @@ function ProjectSelection({ onSelectProject }) {
       setProjects(response.data.projects);
       setLoading(false);
     } catch (err) {
-      setError('Failed to load projects');
+      setError(formatApiError(err, 'Failed to load projects'));
       setLoading(false);
     }
   };
@@ -33,7 +48,7 @@ function ProjectSelection({ onSelectProject }) {
       setShowCreateForm(false);
       onSelectProject(response.data.project_id, newProjectName, true);
     } catch (err) {
-      setError('Failed to create project');
+      setError(formatApiError(err, 'Failed to create project'));
     }
   };
 

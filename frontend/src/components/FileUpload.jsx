@@ -2,6 +2,18 @@ import React, { useState, useEffect } from 'react';
 import api from '../utils/api';
 
 function FileUpload({ projectId, onComplete }) {
+  // #region agent log
+  const __agentLog = (payload) => {
+    try {
+      window.__debugBuffer = window.__debugBuffer || [];
+      window.__debugBuffer.push(payload);
+      // eslint-disable-next-line no-console
+      console.log('[debug]', payload);
+    } catch {}
+    fetch('http://127.0.0.1:7243/ingest/a090e97f-e35b-4efd-9272-c010d2bb89a9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).catch(()=>{});
+  };
+  // #endregion
+
   const [file, setFile] = useState(null);
   const [fileType, setFileType] = useState('');
   const [extractedData, setExtractedData] = useState([]);
@@ -41,6 +53,10 @@ function FileUpload({ projectId, onComplete }) {
   const handleFileSelect = (e) => {
     const selectedFile = e.target.files[0];
     if (selectedFile) {
+      // #region agent log
+      __agentLog({location:'frontend/src/components/FileUpload.jsx:handleFileSelect',message:'file_selected',data:{size:selectedFile?.size,type:String(selectedFile?.type||''),nameEndsWithCsv:!!selectedFile?.name?.toLowerCase?.().endsWith('.csv')},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'});
+      // #endregion
+
       setFile(selectedFile);
 
       // Determine file type
@@ -65,12 +81,20 @@ function FileUpload({ projectId, onComplete }) {
   const handleUpload = async () => {
     if (!file) return;
 
+    // #region agent log
+    __agentLog({location:'frontend/src/components/FileUpload.jsx:handleUpload',message:'upload_start',data:{fileType:String(fileType||''),fileSize:file?.size,hasFile:!!file,projectIdPresent:!!projectId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'});
+    // #endregion
+
     setLoading(true);
     setError('');
 
     try {
       const response = await api.extractData(file, fileType);
       const data = response.data.data;
+
+      // #region agent log
+      __agentLog({location:'frontend/src/components/FileUpload.jsx:handleUpload',message:'upload_response_received',data:{status:response?.status,hasDataArray:Array.isArray(data),dataLength:Array.isArray(data)?data.length:null},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'});
+      // #endregion
 
       // Initialize extracted data with empty categories
       const processedData = data.map((item) => ({
@@ -80,7 +104,14 @@ function FileUpload({ projectId, onComplete }) {
 
       setExtractedData(processedData);
       setStep(2);
+
+      // #region agent log
+      __agentLog({location:'frontend/src/components/FileUpload.jsx:handleUpload',message:'step_set_to_2',data:{processedLength:Array.isArray(processedData)?processedData.length:null},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'});
+      // #endregion
     } catch (err) {
+      // #region agent log
+      __agentLog({location:'frontend/src/components/FileUpload.jsx:handleUpload',message:'upload_error',data:{message:String(err?.message||''),status:err?.response?.status,hasResponse:!!err?.response,hasResponseData:!!err?.response?.data,errorField:String(err?.response?.data?.error||'')},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'});
+      // #endregion
       setError(err.response?.data?.error || 'Failed to extract data from file');
     } finally {
       setLoading(false);

@@ -10,7 +10,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 import base64
@@ -61,8 +61,116 @@ def get_openai_client() -> OpenAI:
         return _openai_client
     # OpenAI SDK will also read OPENAI_API_KEY from env by default
     api_key = os.getenv("OPENAI_API_KEY", "")
-    _openai_client = OpenAI(api_key=api_key or None)
+    timeout_s = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "20") or "20")
+    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "0") or "0")
+    _openai_client = OpenAI(api_key=api_key or None, timeout=timeout_s, max_retries=max_retries)
     return _openai_client
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except Exception:
+        return default
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except Exception:
+        return default
+
+
+def _decode_bytes_best_effort(b: bytes) -> str:
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("latin-1", errors="replace")
+
+
+def _coerce_amount(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    # Remove currency/commas and keep digits, dot, minus
+    s = s.replace(",", "")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if not s or s in ("-", ".", "-."):
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _normalize_type(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    if s in ("income", "incomes"):
+        return "Income"
+    if s in ("expense", "expenses"):
+        return "Expenses"
+    if s in ("saving", "savings"):
+        return "Savings"
+    return None
+
+
+def _normalize_transactions(items: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Normalize AI output into a list of transactions that the frontend/backend expect:
+      - date: YYYY-MM-DD
+      - type: Income|Expenses|Savings
+      - amount: float
+      - description: str
+    Returns (normalized, errors).
+    """
+    errors: List[str] = []
+    if not isinstance(items, list):
+        return [], [f"AI output is not a JSON array (got {type(items).__name__})"]
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            errors.append(f"row[{idx}] is not an object")
+            continue
+
+        # Accept a few common key variants defensively
+        date_raw = raw.get("date") or raw.get("Date") or raw.get("transaction_date") or raw.get("transactionDate")
+        type_raw = raw.get("type") or raw.get("Type")
+        amount_raw = raw.get("amount") or raw.get("Amount")
+        desc_raw = raw.get("description") or raw.get("Description") or raw.get("desc") or ""
+
+        ttype = _normalize_type(type_raw)
+        amt = _coerce_amount(amount_raw)
+        date_norm = parse_date(str(date_raw or "").strip()) if date_raw is not None else None
+
+        if not date_norm or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date_norm)):
+            errors.append(f"row[{idx}] invalid date: {date_raw!r}")
+            continue
+        if ttype is None:
+            errors.append(f"row[{idx}] invalid type: {type_raw!r}")
+            continue
+        if amt is None:
+            errors.append(f"row[{idx}] invalid amount: {amount_raw!r}")
+            continue
+
+        normalized.append(
+            {
+                "date": date_norm,
+                "type": ttype,
+                "amount": float(abs(amt)),
+                "description": str(desc_raw or ""),
+            }
+        )
+
+    return normalized, errors
 
 
 @app.before_request
@@ -458,15 +566,61 @@ def process_chunk_with_ai(content_chunk, content_type="csv"):
         raise e  # Re-raise to be handled by caller
 
 
+def process_csv_with_ai(raw_csv: str) -> Any:
+    """
+    Process raw CSV text using OpenAI in a single request.
+    Returns parsed JSON (expected: array of objects).
+    """
+    system_prompt = """You are a financial data extraction assistant.
+Return ONLY a valid JSON array (no prose, no markdown) where each element is a transaction object with EXACT keys:
+- date: string in YYYY-MM-DD
+- type: one of Income, Expenses, Savings
+- amount: number (no currency symbols)
+- description: string
+
+Rules:
+- Use positive numbers for amount. Use the type field to indicate Income/Expenses/Savings.
+- If a row is not a transaction, ignore it.
+- If the CSV contains a header row, use it to interpret columns.
+"""
+
+    user_prompt = f"Extract transaction data from this raw CSV:\n\n{raw_csv}"
+
+    response = get_openai_client().chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+    )
+    result = response.choices[0].message.content.strip()
+    result = re.sub(r"^```json\s*", "", result)
+    result = re.sub(r"\s*```$", "", result)
+    return json.loads(result)
+
+
 @app.route('/api/extract-data', methods=['POST'])
 def extract_data():
     """Extract transaction data from uploaded file using AI"""
     try:
+        t0 = time.time()
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': 'No file uploaded'}), 400
 
         file = request.files['file']
         file_type = request.form.get('fileType', '')
+        request_id = getattr(g, "request_id", None)
+        logger.info(
+            json.dumps(
+                {
+                    "event": "extract_start",
+                    "request_id": request_id,
+                    "file_type": file_type,
+                    "content_type": getattr(file, "mimetype", None),
+                }
+            )
+        )
 
         if not os.getenv("OPENAI_API_KEY"):
             return jsonify({
@@ -477,38 +631,76 @@ def extract_data():
         extracted_data = []
 
         if file_type == 'csv':
-            # Process CSV file
+            # Process CSV file (raw CSV text; no chunking)
             try:
-                df = pd.read_csv(file)
-                extracted_data = []
-                
-                # Chunking parameters
-                chunk_size = 50
-                total_rows = len(df)
-                
-                print(f"Processing CSV with {total_rows} rows in chunks of {chunk_size}...")
+                max_csv_bytes = _safe_int_env("MAX_CSV_BYTES", 200_000)
+                raw_bytes = file.read()
+                file_size_bytes = len(raw_bytes or b"")
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "extract_csv_read",
+                            "request_id": request_id,
+                            "file_size_bytes": file_size_bytes,
+                            "max_csv_bytes": max_csv_bytes,
+                            "read_ms": int((time.time() - t0) * 1000),
+                        }
+                    )
+                )
 
-                for i in range(0, total_rows, chunk_size):
-                    chunk = df.iloc[i:i+chunk_size]
-                    csv_content = chunk.to_string()
-                    
-                    try:
-                        chunk_data = process_chunk_with_ai(csv_content, "csv")
-                        extracted_data.extend(chunk_data)
-                        print(f"  Processed chunk {i//chunk_size + 1}/{(total_rows + chunk_size - 1)//chunk_size}")
-                    except Exception as e:
-                        print(f"  Error processing chunk starting at row {i}: {e}")
-                        # Continue to next chunk or fail? Let's continue but log.
-                        # For now, we will fail if AI fails to parse JSON completely, 
-                        # but in production partial success might be better.
-                        # Re-raising for now to bubble up the OpenAI specific errors.
-                        raise e
+                if file_size_bytes > max_csv_bytes:
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": f"CSV too large for serverless extraction. Please split into smaller files. (size={file_size_bytes} bytes, max={max_csv_bytes} bytes)",
+                                "request_id": request_id,
+                            }
+                        ),
+                        413,
+                    )
 
+                raw_csv = _decode_bytes_best_effort(raw_bytes)
+
+                t_openai0 = time.time()
+                ai_out = process_csv_with_ai(raw_csv)
+                openai_call_ms = int((time.time() - t_openai0) * 1000)
+
+                normalized, norm_errors = _normalize_transactions(ai_out)
+                extracted_data = normalized
+
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "extract_csv_done",
+                            "request_id": request_id,
+                            "openai_call_ms": openai_call_ms,
+                            "returned_count": len(extracted_data),
+                            "validation_errors": len(norm_errors),
+                            "total_ms": int((time.time() - t0) * 1000),
+                        }
+                    )
+                )
+
+                if not extracted_data:
+                    # Keep response small but actionable
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": "CSV extraction returned no valid transactions. Please try a smaller file or adjust the CSV format.",
+                                "request_id": request_id,
+                                "details": norm_errors[:10],
+                            }
+                        ),
+                        422,
+                    )
             except Exception as e:
                 if "openai" in str(type(e)).lower():
                     msg, code = handle_openai_error(e)
-                    return jsonify({'success': False, 'error': msg}), code
-                return jsonify({'success': False, 'error': f'CSV processing error: {str(e)}'}), 500
+                    return jsonify({'success': False, 'error': msg, "request_id": request_id}), code
+                logger.exception("extract_csv_failed")
+                return jsonify({'success': False, 'error': f'CSV processing error: {str(e)}', "request_id": request_id}), 500
 
         elif file_type == 'json':
             # Process JSON file
@@ -608,10 +800,10 @@ def extract_data():
         else:
             return jsonify({'success': False, 'error': 'Unsupported file type'}), 400
 
-        # Normalize dates
+        # Normalize dates (best-effort) for non-CSV paths
         for transaction in extracted_data:
-            if 'date' in transaction:
-                transaction['date'] = parse_date(transaction['date'])
+            if isinstance(transaction, dict) and 'date' in transaction:
+                transaction['date'] = parse_date(str(transaction['date']))
 
         return jsonify({'success': True, 'data': extracted_data})
 

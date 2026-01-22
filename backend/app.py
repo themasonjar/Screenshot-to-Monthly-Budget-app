@@ -13,6 +13,11 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
+try:
+    # OpenAI SDK exception types (available in openai>=1.x)
+    from openai import APITimeoutError, APIConnectionError, APIStatusError, RateLimitError  # type: ignore
+except Exception:  # pragma: no cover
+    APITimeoutError = APIConnectionError = APIStatusError = RateLimitError = Exception  # type: ignore
 import base64
 from io import BytesIO
 from PIL import Image
@@ -61,7 +66,7 @@ def get_openai_client() -> OpenAI:
         return _openai_client
     # OpenAI SDK will also read OPENAI_API_KEY from env by default
     api_key = os.getenv("OPENAI_API_KEY", "")
-    timeout_s = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "20") or "20")
+    timeout_s = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "60") or "60")
     max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "0") or "0")
     _openai_client = OpenAI(api_key=api_key or None, timeout=timeout_s, max_retries=max_retries)
     return _openai_client
@@ -507,32 +512,49 @@ def parse_date(date_str):
 def handle_openai_error(e):
     """Handle OpenAI API errors and return user-friendly messages"""
     error_msg = str(e)
-    status_code = 500
+    timeout_s = _safe_float_env("OPENAI_TIMEOUT_SECONDS", 60.0)
+    status_code: Optional[int] = None
     
     # Check for specific error types based on exception class name or message content
     # Note: We use string matching to avoid importing all exception classes if not strictly necessary,
     # but importing them is better practice. For now, we'll check the error object attributes.
     
     if hasattr(e, 'status_code'):
-        status_code = e.status_code
+        try:
+            status_code = int(getattr(e, 'status_code'))
+        except Exception:
+            status_code = None
     elif hasattr(e, 'http_status'):
-        status_code = e.http_status
+        try:
+            status_code = int(getattr(e, 'http_status'))
+        except Exception:
+            status_code = None
+
+    # Timeout / connection classification (often no http status)
+    if isinstance(e, APITimeoutError) or "timed out" in error_msg.lower() or "timeout" in error_msg.lower():
+        return f"OpenAI request timed out after {timeout_s:.0f}s. Please try again later.", 504
+    if isinstance(e, APIConnectionError):
+        return "OpenAI connection error: failed to reach OpenAI. Please try again later.", 502
         
     if status_code == 401:
         return "Authentication Error (401): Your OpenAI API key is invalid or missing. Please check your .env file.", 401
-    elif status_code == 429:
+    elif status_code == 429 or isinstance(e, RateLimitError):
         return "Rate Limit/Quota Error (429): You have exceeded your OpenAI API quota or rate limit. Please check your billing details at platform.openai.com/account/billing.", 429
     elif status_code == 404:
         if 'model' in error_msg.lower():
             return "Model Not Found (404): The selected AI model is not available for your API key. You may need to add payment details to your OpenAI account to access GPT-4o.", 404
         return f"Not Found Error (404): {error_msg}", 404
-    elif status_code == 500:
-        return "OpenAI Server Error (500): OpenAI's servers are currently experiencing issues. Please try again later.", 500
-    elif status_code == 503:
-        return "Service Unavailable (503): OpenAI's servers are overloaded. Please try again later.", 503
+    elif status_code in (500, 502, 503, 504) or isinstance(e, APIStatusError):
+        # Treat as upstream failure (OpenAI/service network). Preserve status if present; default to 502.
+        upstream = status_code or 502
+        if upstream == 503:
+            return "OpenAI service unavailable (503): OpenAI's servers are overloaded. Please try again later.", 503
+        if upstream == 500:
+            return "OpenAI upstream error (500): OpenAI returned an internal error. Please try again later.", 502
+        return f"OpenAI upstream error ({upstream}): Please try again later.", 502
         
     # Generic fallback
-    return f"OpenAI API Error: {error_msg}", status_code
+    return f"OpenAI API Error: {error_msg}", status_code or 500
 
 
 def process_chunk_with_ai(content_chunk, content_type="csv"):
@@ -697,6 +719,21 @@ def extract_data():
                     )
             except Exception as e:
                 if "openai" in str(type(e)).lower():
+                    # Improved logging: capture exception type/status/elapsed time
+                    logger.warning(
+                        json.dumps(
+                            {
+                                "event": "openai_error",
+                                "request_id": request_id,
+                                "route": "/api/extract-data",
+                                "file_type": "csv",
+                                "exc_type": type(e).__name__,
+                                "status_code": getattr(e, "status_code", getattr(e, "http_status", None)),
+                                "message": str(e)[:500],
+                                "elapsed_ms": int((time.time() - t0) * 1000),
+                            }
+                        )
+                    )
                     msg, code = handle_openai_error(e)
                     return jsonify({'success': False, 'error': msg, "request_id": request_id}), code
                 logger.exception("extract_csv_failed")
@@ -742,6 +779,19 @@ def extract_data():
 
             except Exception as e:
                 if "openai" in str(type(e)).lower():
+                    logger.warning(
+                        json.dumps(
+                            {
+                                "event": "openai_error",
+                                "request_id": getattr(g, "request_id", None),
+                                "route": "/api/extract-data",
+                                "file_type": "excel",
+                                "exc_type": type(e).__name__,
+                                "status_code": getattr(e, "status_code", getattr(e, "http_status", None)),
+                                "message": str(e)[:500],
+                            }
+                        )
+                    )
                     msg, code = handle_openai_error(e)
                     return jsonify({'success': False, 'error': msg}), code
                 return jsonify({'success': False, 'error': f'Excel processing error: {str(e)}'}), 500
@@ -793,6 +843,19 @@ def extract_data():
 
             except Exception as e:
                 if "openai" in str(type(e)).lower():
+                    logger.warning(
+                        json.dumps(
+                            {
+                                "event": "openai_error",
+                                "request_id": getattr(g, "request_id", None),
+                                "route": "/api/extract-data",
+                                "file_type": "image",
+                                "exc_type": type(e).__name__,
+                                "status_code": getattr(e, "status_code", getattr(e, "http_status", None)),
+                                "message": str(e)[:500],
+                            }
+                        )
+                    )
                     msg, code = handle_openai_error(e)
                     return jsonify({'success': False, 'error': msg}), code
                 return jsonify({'success': False, 'error': f'Image processing error: {str(e)}'}), 500
